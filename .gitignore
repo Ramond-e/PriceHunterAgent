@@ -20,3 +20,6 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# Browser session data (login cookies — do not commit)
+browser-data/

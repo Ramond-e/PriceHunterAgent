@@ -32,10 +32,16 @@ public class OpenAiCompatibleProvider : ILlmProvider
 
     public string Name => $"{_providerName} {_model}";
 
-    public OpenAiCompatibleProvider(IHttpClientFactory factory, IConfiguration config, string providerKey)
+    public OpenAiCompatibleProvider(
+        IHttpClientFactory factory,
+        IConfiguration config,
+        string providerKey,
+        string? apiKeyOverride = null)
     {
         var section = config.GetSection(providerKey);
-        var apiKey  = section["ApiKey"] ?? "";
+        var apiKey  = !string.IsNullOrWhiteSpace(apiKeyOverride)
+                          ? apiKeyOverride
+                          : section["ApiKey"] ?? "";
         var baseUrl = section["BaseUrl"]
             ?? throw new InvalidOperationException($"{providerKey}:BaseUrl not configured");
 
@@ -46,7 +52,7 @@ public class OpenAiCompatibleProvider : ILlmProvider
         if (!string.IsNullOrEmpty(apiKey))
             _http.DefaultRequestHeaders.Add("Authorization", $"Bearer {apiKey}");
         _http.BaseAddress = new Uri(baseUrl);
-        _http.Timeout     = TimeSpan.FromMinutes(2);
+        _http.Timeout     = TimeSpan.FromMinutes(3);
     }
 
     public async Task<LlmResponse> CompleteAsync(
@@ -143,12 +149,27 @@ public class OpenAiCompatibleProvider : ILlmProvider
         // return ALL results before calling CompleteAsync again.
         if (finishReason == "tool_calls" && message.ToolCalls?.Count > 0)
         {
-            // Build the exact assistant message OpenAI needs replayed in history
+            // Collect thinking: reasoning_content (chain-of-thought models) first,
+            // then any pre-tool text content the model emitted before the tool call.
+            var thinkingParts = new List<string>();
+            if (!string.IsNullOrWhiteSpace(message.ReasoningContent))
+                thinkingParts.Add(message.ReasoningContent.Trim());
+            if (!string.IsNullOrWhiteSpace(message.Content))
+                thinkingParts.Add(message.Content.Trim());
+            var thinking = thinkingParts.Count > 0 ? string.Join("\n\n", thinkingParts) : null;
+
+            // Build the exact assistant message replayed in history.
+            // Preserve both content and reasoning_content so DeepSeek does not complain.
             var assistantMsgObj = new
             {
-                role       = "assistant",
-                content    = (string?)null,
-                tool_calls = message.ToolCalls.Select(tc => new
+                role              = "assistant",
+                content           = string.IsNullOrEmpty(message.Content)
+                                        ? (string?)null
+                                        : message.Content,
+                reasoning_content = string.IsNullOrEmpty(message.ReasoningContent)
+                                        ? (string?)null
+                                        : message.ReasoningContent,
+                tool_calls        = message.ToolCalls.Select(tc => new
                 {
                     id       = tc.Id,
                     type     = "function",
@@ -168,10 +189,11 @@ public class OpenAiCompatibleProvider : ILlmProvider
 
             return new LlmResponse
             {
-                StopReason    = "tool_use",
-                ToolCall      = allToolCalls[0],        // primary (for single-tool consumers)
-                AllToolCalls  = allToolCalls,            // ALL tool calls
-                RawContent    = rawElement               // exact assistant turn for history replay
+                StopReason   = "tool_use",
+                Thinking     = thinking,
+                ToolCall     = allToolCalls[0],
+                AllToolCalls = allToolCalls,
+                RawContent   = rawElement
             };
         }
 
@@ -198,8 +220,10 @@ public class OpenAiCompatibleProvider : ILlmProvider
 
     private record AssistantMsg
     {
-        public string?            Content   { get; init; }
-        public List<OaiToolCall>? ToolCalls { get; init; }
+        public string?            Content          { get; init; }
+        [JsonPropertyName("reasoning_content")]
+        public string?            ReasoningContent { get; init; }
+        public List<OaiToolCall>? ToolCalls        { get; init; }
     }
 
     private record OaiToolCall

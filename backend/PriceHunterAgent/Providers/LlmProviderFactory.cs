@@ -4,7 +4,8 @@ namespace PriceHunterAgent.Providers;
 /// Reads "LlmProvider" from appsettings.json and returns the correct ILlmProvider.
 ///
 /// Supported values:
-///   "Anthropic"   → Claude Sonnet (default)
+///   "DeepSeek"    → DeepSeek V4 Pro (default for this project)
+///   "Anthropic"   → Claude Sonnet
 ///   "OpenAI"      → GPT-4o / GPT-4o-mini
 ///   "Groq"        → Llama 3.3 70B (free tier available)
 ///   "AzureOpenAI" → Azure-hosted GPT-4
@@ -15,11 +16,12 @@ public static class LlmProviderFactory
     public static ILlmProvider Create(IServiceProvider services)
     {
         var config       = services.GetRequiredService<IConfiguration>();
-        var providerName = config["LlmProvider"] ?? "Anthropic";
+        var providerName = config["LlmProvider"] ?? "DeepSeek";
         var factory      = services.GetRequiredService<IHttpClientFactory>();
 
         return providerName.ToLowerInvariant() switch
         {
+            "deepseek"    => new OpenAiCompatibleProvider(factory, config, "DeepSeek"),
             "anthropic"   => new AnthropicProvider(factory, config),
             "openai"      => new OpenAiCompatibleProvider(factory, config, "OpenAI"),
             "groq"        => new OpenAiCompatibleProvider(factory, config, "Groq"),
@@ -27,7 +29,17 @@ public static class LlmProviderFactory
             "ollama"      => new OpenAiCompatibleProvider(factory, config, "Ollama"),
             _             => throw new InvalidOperationException(
                 $"Unknown LlmProvider: '{providerName}'. " +
-                $"Valid options: Anthropic, OpenAI, Groq, AzureOpenAI, Ollama")
+                $"Valid options: DeepSeek, Anthropic, OpenAI, Groq, AzureOpenAI, Ollama")
         };
     }
+
+    /// <summary>
+    /// Creates a DeepSeek provider with an explicit API key (overrides config value).
+    /// Used for per-request key injection from the frontend settings panel.
+    /// </summary>
+    public static ILlmProvider CreateDeepSeekWithKey(
+        IHttpClientFactory factory,
+        IConfiguration config,
+        string apiKey)
+        => new OpenAiCompatibleProvider(factory, config, "DeepSeek", apiKeyOverride: apiKey);
 }

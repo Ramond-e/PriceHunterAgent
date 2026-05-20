@@ -26,6 +26,12 @@ public record LlmResponse
     public string StopReason { get; init; } = "";
     public string? Text { get; init; }
 
+    /// <summary>
+    /// Any reasoning / pre-decision text the model emits before calling a tool.
+    /// Sourced from reasoning_content (DeepSeek thinking) or content alongside tool_calls.
+    /// </summary>
+    public string? Thinking { get; init; }
+
     /// <summary>First (or only) tool call — always set when IsToolCall is true.</summary>
     public ToolCallRequest? ToolCall { get; init; }
 

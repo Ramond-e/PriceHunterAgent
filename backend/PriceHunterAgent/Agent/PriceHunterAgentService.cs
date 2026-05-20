@@ -1,5 +1,6 @@
 using System.Runtime.CompilerServices;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using PriceHunterAgent.Agent.Models;
 using PriceHunterAgent.Agent.Tools;
 using PriceHunterAgent.Providers;
@@ -7,128 +8,119 @@ using PriceHunterAgent.Providers;
 namespace PriceHunterAgent.Agent;
 
 /// <summary>
-/// Provider-agnostic ReAct agent.
+/// ReAct agent that orchestrates price comparison across Chinese e-commerce platforms
+/// (JD.com, Taobao, Pinduoduo) using the DeepSeek LLM and Browser-Use automation.
 ///
-/// Handles both:
-///   - Single tool call per turn  (Anthropic style)
-///   - Multiple tool calls per turn (OpenAI style — all must be answered before next call)
+/// Login interruptions: when the browser service detects a login page it returns
+/// LOGIN_REQUIRED:{platform}:{taskId}. The agent yields a login_required step,
+/// waits via LoginSessionStore, then continues polling once the user has logged in.
 /// </summary>
 public class PriceHunterAgentService
 {
-    private readonly ILlmProvider _llm;
-    private readonly WebSearchTool _searchTool;
-    private readonly PriceFetchTool _priceTool;
-    private readonly CouponSearchTool _couponTool;
+    private readonly ILlmProvider        _defaultProvider;
+    private readonly BrowserSearchTool   _browserTool;
+    private readonly LoginSessionStore   _sessionStore;
+    private readonly IHttpClientFactory  _httpFactory;
+    private readonly IConfiguration      _config;
 
     private const string SystemPrompt = """
-    You are an expert shopping assistant and price comparison agent.
-    Your goal is to find the absolute best deal for the user's product.
+        你是一个专业的AI比价购物助手，专门在中国各大电商平台寻找最优惠的商品。
 
-    Always:
-    - Search for prices across at least 3-4 different stores
-    - Look for coupon codes to stack on top of the best price
-    - Give a clear final recommendation with reasoning
+        【重要规则】每次调用工具之前，你必须先用中文输出你的分析和决策思路（2-4句话），
+        说明你打算做什么、为什么这样做。这段思考内容要先于工具调用出现在你的回复中。
 
-    CRITICAL — REPORT EXACT DATA FROM TOOLS:
-    - You MUST use the EXACT prices from the search tool results — never change or invent prices
-    - You MUST use the EXACT links from the search tool results — they are already formatted as [Store](url)
-    - Copy the links EXACTLY as they appear — do not replace them with __text__ or any other format
-    - If the tool says Office Depot is $37.99, you MUST report $37.99 — not any other number
-    - Never summarize or paraphrase prices — always show the exact dollar amount from the tool
+        你的目标：
+        1. 调用一次 browser_search，在京东、淘宝、拼多多三个平台搜索商品
+        2. browser_search 会自动点开每个平台前5个商品详情页，提取价格、评价、销量、优惠券信息
+        3. 根据返回的真实数据综合对比，给出最优惠的购买建议
 
-    FORMAT each store result exactly like this:
-    1. **Office Depot** - [Office Depot](https://www.officedepot.com/...) — $37.99
-       - Model: Canon PIXMA TS202
-       - Rating: 4.4/5 (1600 reviews)
-       - Shipping: Free delivery
+        数据准确性要求：
+        - 必须使用工具返回的真实数据，绝对不要编造任何价格或评价数据
+        - 以 ¥XX.XX 格式展示人民币价格
+        - 用 [商品名](链接) markdown 格式展示商品链接
 
-    Be systematic and thorough. Users are counting on you to save them money.
-    """;
+        最终报告格式：
+        ### 京东
+        1. **商品名称** — ¥XX.XX | [店铺名](链接)
+           - 评价：XXXX条 | 优惠券：XX
+
+        ### 淘宝
+        （同上）
+
+        ### 拼多多
+        （同上）
+
+        ---
+        ### 购买建议
+        综合对比后，推荐在【平台】购买【商品名】，理由：价格最低/优惠券最大/评价最好等。
+        """;
 
     private static readonly List<ToolDefinition> ToolDefs = new()
     {
         new ToolDefinition
         {
-            Name        = "search_prices",
-            Description = "Search the web for current prices of a product across multiple stores.",
+            Name        = "browser_search",
+            Description = "使用浏览器在京东、淘宝、拼多多同时搜索商品。会自动点开每个平台前5个商品详情页，提取价格、销量、评价、优惠券信息后关闭，最后汇总返回。整个比价流程只调用一次，不要重复调用。",
             InputSchema = new ToolInputSchema
             {
                 Properties = new()
                 {
-                    ["query"] = new() { Type = "string", Description = "Search query, e.g. 'Sony WH-1000XM5 price'" }
+                    ["product"]   = new() { Type = "string",
+                        Description = "要搜索的商品名称，例如 'iPhone 15 Pro Max 256GB'" },
+                    ["platforms"] = new() { Type = "string",
+                        Description = "固定填写 'jd,taobao,pdd'，一次搜索三个平台" }
                 },
-                Required = ["query"]
-            }
-        },
-        new ToolDefinition
-        {
-            Name        = "fetch_store_price",
-            Description = "Fetch detailed price and availability from a specific store URL.",
-            InputSchema = new ToolInputSchema
-            {
-                Properties = new()
-                {
-                    ["url"]        = new() { Type = "string", Description = "The store product page URL" },
-                    ["store_name"] = new() { Type = "string", Description = "Name of the store, e.g. 'Amazon'" }
-                },
-                Required = ["url", "store_name"]
-            }
-        },
-        new ToolDefinition
-        {
-            Name        = "find_coupons",
-            Description = "Search for coupon codes and cashback offers for a store and product.",
-            InputSchema = new ToolInputSchema
-            {
-                Properties = new()
-                {
-                    ["store_name"]   = new() { Type = "string", Description = "Store name" },
-                    ["product_name"] = new() { Type = "string", Description = "Product name" }
-                },
-                Required = ["store_name", "product_name"]
+                Required = ["product", "platforms"]
             }
         }
     };
 
     public PriceHunterAgentService(
-        ILlmProvider provider,
-        WebSearchTool searchTool,
-        PriceFetchTool priceTool,
-        CouponSearchTool couponTool)
+        ILlmProvider defaultProvider,
+        BrowserSearchTool browserTool,
+        LoginSessionStore sessionStore,
+        IHttpClientFactory httpFactory,
+        IConfiguration config)
     {
-        _llm = provider;
-        _searchTool = searchTool;
-        _priceTool = priceTool;
-        _couponTool = couponTool;
+        _defaultProvider = defaultProvider;
+        _browserTool     = browserTool;
+        _sessionStore    = sessionStore;
+        _httpFactory     = httpFactory;
+        _config          = config;
     }
 
     public async IAsyncEnumerable<AgentStep> RunAsync(
         string product,
+        string apiKey,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
-        var history = new List<ChatMessage>();
+        // Use per-request key if provided, otherwise fall back to configured provider
+        ILlmProvider llm = !string.IsNullOrWhiteSpace(apiKey)
+            ? LlmProviderFactory.CreateDeepSeekWithKey(_httpFactory, _config, apiKey)
+            : _defaultProvider;
 
+        var history = new List<ChatMessage>();
         history.Add(new ChatMessage
         {
             Role = "user",
             Content = $"""
-                Find the best price for: {product}
+                请帮我在各大电商平台比价：{product}
 
-                Please:
-                1. Search for current prices across multiple stores
-                2. Fetch detailed price info from the top 3 cheapest stores
-                3. Look for coupon codes at the store with the best base price
-                4. Give a clear final recommendation: buy now, wait, or compare more?
+                请按以下步骤进行：
+                1. 调用一次 browser_search，product 填商品名，platforms 填 jd,taobao,pdd
+                   （工具会自动在三个平台各点开前5个商品详情页，提取价格、评价、优惠券后汇总）
+                2. 根据返回的真实数据，对比三个平台的价格、销量、评价、优惠券
+                3. 给出最终购买建议：推荐哪个平台、哪款商品，理由是什么
                 """
         });
 
         yield return new AgentStep
         {
-            Type = "thinking",
-            Message = $"🔍 Starting price hunt for: **{product}**\n_Using: {_llm.Name}_"
+            Type    = "thinking",
+            Message = $"开始在各大电商平台比价：**{product}**\n_AI模型：{llm.Name}_"
         };
 
-        int maxIterations = 15;
+        const int maxIterations = 15;
         for (int i = 0; i < maxIterations; i++)
         {
             if (ct.IsCancellationRequested) yield break;
@@ -137,73 +129,103 @@ public class PriceHunterAgentService
             string? llmError = null;
             try
             {
-                response = await _llm.CompleteAsync(SystemPrompt, history, ToolDefs, ct);
+                response = await llm.CompleteAsync(SystemPrompt, history, ToolDefs, ct);
             }
             catch (Exception ex)
             {
-                llmError = $"LLM error ({_llm.Name}): {ex.Message}";
+                llmError = $"AI请求失败 ({llm.Name}): {ex.Message}";
             }
+
             if (llmError != null)
             {
                 yield return new AgentStep { Type = "error", Message = llmError };
                 yield break;
             }
 
-
-            // ── Tool call(s) requested ────────────────────────────────────────
+            // ── Tool call(s) ─────────────────────────────────────────────────
             if (response.IsToolCall)
             {
-                // Determine which tool calls to execute:
-                // OpenAI may return multiple; Anthropic returns one at a time.
+                // Emit the model's reasoning/pre-decision text as a thinking step
+                if (!string.IsNullOrWhiteSpace(response.Thinking))
+                {
+                    yield return new AgentStep
+                    {
+                        Type    = "thinking",
+                        Message = response.Thinking
+                    };
+                }
+
                 var toolCalls = response.AllToolCalls.Count > 0
                     ? response.AllToolCalls
                     : new List<ToolCallRequest> { response.ToolCall! };
 
-                // Step 1: Add assistant turn to history ONCE (contains all tool calls)
                 history.Add(new ChatMessage
                 {
-                    Role = "assistant",
+                    Role    = "assistant",
                     Content = response.RawContent
                 });
 
-                // Step 2: Execute ALL tool calls and collect ALL results
                 var toolResults = new List<object>();
 
                 foreach (var toolCall in toolCalls)
                 {
                     yield return new AgentStep
                     {
-                        Type = "tool_call",
+                        Type    = "tool_call",
                         Message = FormatToolCallMessage(toolCall.Name, toolCall.Input),
-                        Data = new { tool = toolCall.Name, input = toolCall.Input }
+                        Data    = new { tool = toolCall.Name, input = toolCall.Input }
                     };
 
                     string result;
-                    try { result = await ExecuteToolAsync(toolCall.Name, toolCall.Input, ct); }
-                    catch (Exception ex) { result = $"Tool error: {ex.Message}"; }
+                    try
+                    {
+                        result = await ExecuteToolAsync(toolCall.Name, toolCall.Input, apiKey, ct);
+                    }
+                    catch (Exception ex)
+                    {
+                        result = $"工具执行出错: {ex.Message}";
+                    }
+
+                    // ── Handle login interruptions (may repeat for multiple platforms) ──
+                    while (result.StartsWith(BrowserSearchTool.LoginRequiredPrefix))
+                    {
+                        var remainder = result[BrowserSearchTool.LoginRequiredPrefix.Length..];
+                        var colonIdx  = remainder.IndexOf(':');
+                        var platform  = colonIdx >= 0 ? remainder[..colonIdx] : remainder;
+                        var taskId    = colonIdx >= 0 ? remainder[(colonIdx + 1)..] : "";
+
+                        yield return new AgentStep
+                        {
+                            Type    = "login_required",
+                            Message = $"需要在 {platform} 登录，请在上方浏览器窗口中完成登录（扫码或输入账号密码），完成后点击「已完成登录」按钮继续。",
+                            Data    = new { platform, taskId }
+                        };
+
+                        // Block until AgentController.Resume signals us
+                        await _sessionStore.WaitForLoginAsync(taskId, ct);
+
+                        // Continue polling — Python browser resumed after /resume was called
+                        result = await _browserTool.ContinuePollAsync(taskId, ct);
+                    }
 
                     yield return new AgentStep
                     {
-                        Type = "tool_result",
+                        Type    = "tool_result",
                         Message = result,
-                        Data = new { tool = toolCall.Name }
+                        Data    = new { tool = toolCall.Name }
                     };
 
-                    // Collect result — keyed by tool_use_id so provider can match them
                     toolResults.Add(new
                     {
-                        type = "tool_result",
+                        type        = "tool_result",
                         tool_use_id = toolCall.Id,
-                        content = result
+                        content     = result
                     });
                 }
 
-                // Step 3: Add ALL tool results in ONE history message
-                // OpenAI requires: for every tool_call_id in assistant turn,
-                // there must be a matching tool result message
                 history.Add(new ChatMessage
                 {
-                    Role = "user",
+                    Role    = "user",
                     Content = toolResults
                 });
 
@@ -216,9 +238,9 @@ public class PriceHunterAgentService
 
             yield return new AgentStep
             {
-                Type = "answer",
+                Type    = "answer",
                 Message = finalText,
-                Data = BuildPriceReport(product, finalText)
+                Data    = BuildPriceReport(product, finalText)
             };
 
             yield break;
@@ -226,104 +248,123 @@ public class PriceHunterAgentService
 
         yield return new AgentStep
         {
-            Type = "error",
-            Message = "Agent reached max iterations without a final answer."
+            Type    = "error",
+            Message = "Agent 已达到最大迭代次数，未能完成比价。请重新搜索。"
         };
     }
 
-    private async Task<string> ExecuteToolAsync(string name, JsonElement input, CancellationToken ct) =>
-        name switch
+    private async Task<string> ExecuteToolAsync(
+        string name, JsonElement input, string apiKey, CancellationToken ct)
+    {
+        switch (name)
         {
-            "search_prices" => await _searchTool.SearchAsync(input.GetProperty("query").GetString()!),
-            "fetch_store_price" => await _priceTool.FetchPriceAsync(
-                                        input.GetProperty("url").GetString()!,
-                                        input.GetProperty("store_name").GetString()!),
-            "find_coupons" => await _couponTool.FindCouponsAsync(
-                                        input.GetProperty("store_name").GetString()!,
-                                        input.GetProperty("product_name").GetString()!),
-            _ => $"Unknown tool: {name}"
-        };
+            case "browser_search":
+            {
+                var prod      = input.GetProperty("product").GetString()!;
+                var platStr   = input.TryGetProperty("platforms", out var pEl)
+                                    ? pEl.GetString() ?? "jd,taobao,pdd"
+                                    : "jd,taobao,pdd";
+                var platforms = platStr.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                return await _browserTool.SearchAsync(prod, platforms, apiKey, ct);
+            }
+
+            default:
+                return $"未知工具: {name}";
+        }
+    }
 
     private static string FormatToolCallMessage(string name, JsonElement input) =>
         name switch
         {
-            "search_prices" => $"🔎 Searching: \"{input.GetProperty("query").GetString()}\"",
-            "fetch_store_price" => $"🏪 Fetching price from {input.GetProperty("store_name").GetString()}",
-            "find_coupons" => $"🏷️ Hunting coupons at {input.GetProperty("store_name").GetString()}",
-            _ => $"🔧 Calling tool: {name}"
+            "browser_search" => FormatBrowserSearchMsg(input),
+            _                => $"调用工具：{name}"
         };
+
+    private static string FormatBrowserSearchMsg(JsonElement input)
+    {
+        var product  = input.TryGetProperty("product",   out var p)  ? p.GetString()  ?? "" : "";
+        var platform = input.TryGetProperty("platforms", out var pl) ? pl.GetString() ?? "全部" : "全部";
+        return $"正在浏览器中搜索「{product}」— 平台：{platform}（将逐一点开前5个商品，含优惠券）";
+    }
+
+    // ── Build structured price report from agent's final markdown answer ──────
 
     private static PriceReport BuildPriceReport(string product, string agentAnswer)
     {
-        // Parse real listings from the agent answer.
-        // Looks for markdown links in the format: [Store](url) ... $XX.XX
         var listings = new List<PriceListing>();
+        var lines    = agentAnswer.Split('\n', StringSplitOptions.RemoveEmptyEntries);
 
-        var lines = agentAnswer.Split('\n', StringSplitOptions.RemoveEmptyEntries);
         foreach (var line in lines)
         {
-            // Try to extract a URL from a markdown link: [text](url)
-            var urlMatch = System.Text.RegularExpressions.Regex.Match(line, @"\[([^\]]+)\]\((https?://[^\)]+)\)");
-            // Try to extract a price: $XX.XX
-            var priceMatch = System.Text.RegularExpressions.Regex.Match(line, @"\$[\d,]+\.?\d*");
+            // Match markdown link: [text](url)
+            var urlMatch = Regex.Match(line, @"\[([^\]]+)\]\((https?://[^\)]+)\)");
+            // Match CNY price: ¥XX or ￥XX
+            var priceMatch = Regex.Match(line, @"[¥￥]([\d,]+\.?\d*)");
 
-            if (priceMatch.Success)
+            if (!priceMatch.Success) continue;
+
+            var priceStr = "¥" + priceMatch.Groups[1].Value;
+            var numericStr = priceMatch.Groups[1].Value.Replace(",", "");
+            double.TryParse(numericStr, out var priceNumeric);
+
+            var store = urlMatch.Success ? urlMatch.Groups[1].Value : ExtractPlatformName(line);
+            var url   = urlMatch.Success ? urlMatch.Groups[2].Value : "";
+
+            if (listings.Any(l => l.Store == store)) continue;
+
+            var notes = "";
+            if (line.Contains("免运费") || line.Contains("包邮")) notes = "包邮";
+            else if (line.Contains("自营")) notes = "官方自营";
+
+            listings.Add(new PriceListing
             {
-                var priceStr = priceMatch.Value;
-                var priceNumeric = double.TryParse(
-                    priceStr.Replace("$", "").Replace(",", ""),
-                    out var p) ? p : 0;
-
-                var store = urlMatch.Success ? urlMatch.Groups[1].Value : "Store";
-                var url = urlMatch.Success ? urlMatch.Groups[2].Value : "";
-
-                // Skip if already added this store
-                if (listings.Any(l => l.Store == store)) continue;
-
-                var notes = "";
-                if (line.ToLower().Contains("free")) notes = "Free shipping";
-                else if (line.ToLower().Contains("pickup")) notes = "Store pickup available";
-
-                listings.Add(new PriceListing
-                {
-                    Store = store,
-                    Price = priceStr,
-                    PriceNumeric = priceNumeric,
-                    Url = url,
-                    Notes = notes,
-                    IsBestPrice = false
-                });
-            }
+                Store        = store,
+                Price        = priceStr,
+                PriceNumeric = priceNumeric,
+                Url          = url,
+                Notes        = notes,
+                IsBestPrice  = false
+            });
         }
 
-        // Mark cheapest as best price
         if (listings.Count > 0)
         {
             var cheapest = listings.MinBy(l => l.PriceNumeric);
             if (cheapest != null) cheapest.IsBestPrice = true;
         }
 
-        // Extract coupon if mentioned
-        var couponMatch = System.Text.RegularExpressions.Regex.Match(
-            agentAnswer, @"coupon[:\s]+([A-Z0-9]+)", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-        var coupon = couponMatch.Success ? couponMatch.Groups[1].Value : null;
+        // Extract coupon if mentioned: "XX元券" or "满XX减XX"
+        var couponMatch = Regex.Match(agentAnswer, @"(满\d+减\d+|\d+元(?:无门槛)?券|立减\d+)", RegexOptions.IgnoreCase);
+        var coupon = couponMatch.Success ? couponMatch.Value : null;
+
+        var answerUpper = agentAnswer.ToUpper();
+        var recommendation = answerUpper.Contains("等待") || answerUpper.Contains("等一等")
+            ? "WAIT"
+            : answerUpper.Contains("立即购买") || answerUpper.Contains("推荐购买") || answerUpper.Contains("超值")
+                ? "BUY_NOW"
+                : "COMPARE";
 
         var bestDealLine = lines.FirstOrDefault(l =>
-            l.ToLower().Contains("best deal") || l.ToLower().Contains("best price") ||
-            l.ToLower().Contains("cheapest") || l.ToLower().Contains("recommend"));
+            l.Contains("推荐") || l.Contains("最优") || l.Contains("最划算") || l.Contains("购买建议"))
+            ?.Trim().TrimStart('#', '*', ' ');
 
         return new PriceReport
         {
-            Product = product,
-            Recommendation = agentAnswer.ToUpper().Contains("WAIT") ? "WAIT"
-                                 : agentAnswer.ToUpper().Contains("BUY NOW") ||
-                                   agentAnswer.ToLower().Contains("great deal") ? "BUY_NOW"
-                                 : "COMPARE",
+            Product              = product,
+            Recommendation       = recommendation,
             RecommendationReason = agentAnswer,
-            SearchedAt = DateTime.UtcNow,
-            Listings = listings.Count > 0 ? listings : new List<PriceListing>(),
-            BestDeal = bestDealLine?.Trim().TrimStart('#', '*', ' ') ?? "",
-            CouponFound = coupon
+            SearchedAt           = DateTime.UtcNow,
+            Listings             = listings,
+            BestDeal             = bestDealLine ?? "",
+            CouponFound          = coupon
         };
+    }
+
+    private static string ExtractPlatformName(string line)
+    {
+        if (line.Contains("京东") || line.Contains("JD")) return "京东";
+        if (line.Contains("淘宝") || line.Contains("天猫") || line.Contains("Taobao")) return "淘宝";
+        if (line.Contains("拼多多") || line.Contains("PDD")) return "拼多多";
+        return "电商平台";
     }
 }

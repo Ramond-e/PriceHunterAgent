@@ -1,0 +1,67 @@
+version: "3.9"
+
+# ── AI 比价购物系统 ────────────────────────────────────────────────────────────
+#
+# 启动：docker compose up --build
+# 访问：http://localhost
+#
+# 首次启动后在前端页面输入 DeepSeek API Key 即可开始使用，无需任何配置文件。
+
+services:
+
+  # ── Python Browser-Use 微服务 ────────────────────────────────────────────────
+  # 运行 Xvfb + Chromium，通过 noVNC 将浏览器画面暴露在 :6080
+  browser-service:
+    build:
+      context: ./browser-service
+      dockerfile: Dockerfile
+    environment:
+      - DISPLAY=:99
+      - IN_DOCKER=true
+      - BROWSER_LLM_MODEL=deepseek-chat
+    ports:
+      - "6080:6080"    # noVNC WebSocket（前端 iframe 直连）
+    shm_size: "2gb"    # Chromium 需要足够的共享内存
+    volumes:
+      # 源码热挂载：本地修改 Python 文件后 uvicorn --reload 自动生效，无需重新 build
+      - ./browser-service:/app
+      # Chromium 用户数据持久化：登录过的 Cookie/Session 保留，重启容器不需要重新扫码
+      - ./browser-data:/app/browser-data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ── C# ASP.NET Core 后端 ─────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "5000:5000"
+    environment:
+      - ASPNETCORE_URLS=http://+:5000
+      - ASPNETCORE_ENVIRONMENT=Production
+      - LlmProvider=DeepSeek
+      - BrowserServiceUrl=http://browser-service:8000
+    dns:
+      - 8.8.8.8
+      - 223.5.5.5
+    depends_on:
+      browser-service:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── React 前端（nginx 静态服务 + API 反代）────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
