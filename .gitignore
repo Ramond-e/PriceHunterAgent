@@ -23,3 +23,8 @@ Thumbs.db
 
 # Browser session data (login cookies — do not commit)
 browser-data/
+
+
+# docker-tar-file
+pricehunteragent-all.tar
+docker-compose.dist.yml
