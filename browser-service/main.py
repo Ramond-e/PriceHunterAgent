@@ -432,10 +432,12 @@ PLATFORM_TASKS = {
         "第2步：点击页面顶部的搜索框，输入 {product}，点击搜索按钮，等待搜索结果页加载。\n"
         "第3步：立即调用 dismiss_pdd_overlay 关闭可能出现的'扫码用App打开'浮层。\n"
         "第4步：若出现登录弹窗，立即调用 wait_for_user_login('拼多多')，不要点弹窗内任何按钮。\n"
-        "第5步：向下滚动搜索结果页，每次滚动后等待内容加载，直到页面中至少出现5个商品卡片。\n"
+        "第5步：向下滚动搜索结果页，每次滚动后等待内容加载。【严格限制：最多只滑动6次，超过6次立即停止】\n"
         "第6步：调用 extract_pdd_search_results，从搜索结果页直接提取商品数据（名称/价格/优惠/销量）。\n"
-        "  - 若返回商品数量不足5个，继续向下滚动再次调用，直到获得至少5条数据。\n"
+        "  - 若商品数不足5个但已滑动6次，不再继续滑动，直接用已有数据。\n"
         "第7步：调用 extract_pdd_product_links 获取商品链接列表（用于进入详情页）。\n"
+        "  - 若 extract_pdd_product_links 返回链接，优先用 open_tab 打开详情页。\n"
+        "  - 若没有链接，尝试调用 tap_pdd_product 点击第1、2、3、4、5个商品。\n"
         "第8步：从链接列表中取前5个，逐一用 open_tab 打开详情页（每次只开一个）：\n"
         "  (a) open_tab 打开链接，等待页面加载；若页面无法加载或强制跳转App则跳过此商品\n"
         "  (b) 在详情页提取商品名称、当前价格\n"
@@ -657,6 +659,61 @@ def make_controller(task_id: str, platform: str = "") -> Controller:
                 return json.dumps(links, ensure_ascii=False)
             except Exception as e:
                 return f"提取链接失败: {e}"
+
+        @controller.action(
+            "在拼多多搜索结果页模拟点击第 n 个商品（n 从1开始）。"
+            "当 extract_pdd_product_links 无法提取链接时，用此方法尝试触发商品页面跳转。"
+        )
+        async def tap_pdd_product(n: int) -> str:
+            """用 JavaScript 触摸事件模拟点击第 n 个商品卡片，绕过移动端 onclick 限制。"""
+            try:
+                ctx = _automation_context
+                if ctx is None:
+                    return "浏览器上下文未初始化。"
+                page = await ctx.get_current_page()
+
+                result: str = await page.evaluate(f"""() => {{
+                    const idx = {n} - 1;
+                    // 尝试多种商品卡片选择器
+                    const selectors = [
+                        'li[data-goods-id]', 'li.goods-list-item',
+                        '[class*="goods-item"]', '[class*="GoodsCard"]',
+                        '[class*="SearchListItem"]', '.list-view > li',
+                        '.commodity-list > li', 'li.list-item'
+                    ];
+                    let cards = [];
+                    for (const sel of selectors) {{
+                        cards = Array.from(document.querySelectorAll(sel));
+                        if (cards.length > idx) break;
+                    }}
+                    if (cards.length <= idx) {{
+                        return '未找到第' + {n} + '个商品卡片，当前找到 ' + cards.length + ' 个';
+                    }}
+                    const el = cards[idx];
+                    const rect = el.getBoundingClientRect();
+                    const cx = rect.left + rect.width / 2;
+                    const cy = rect.top + rect.height / 2;
+
+                    // 先尝试直接 click
+                    const clickable = el.querySelector('a') || el;
+                    clickable.click();
+
+                    // 再补发 touch 事件（移动端）
+                    const touch = new Touch({{identifier: Date.now(), target: el, clientX: cx, clientY: cy}});
+                    el.dispatchEvent(new TouchEvent('touchstart', {{bubbles:true, touches:[touch], changedTouches:[touch]}}));
+                    el.dispatchEvent(new TouchEvent('touchend',   {{bubbles:true, touches:[],    changedTouches:[touch]}}));
+
+                    // 尝试触发 href 跳转
+                    const link = el.querySelector('a[href]');
+                    if (link && link.href) return '已触发点击，链接: ' + link.href;
+                    return '已触发点击第' + {n} + '个商品';
+                }}""")
+
+                await asyncio.sleep(1.5)  # 等待页面响应跳转
+                current_url = page.url
+                return f"{result}。当前页面: {current_url}"
+            except Exception as e:
+                return f"模拟点击失败: {e}"
 
     return controller
 

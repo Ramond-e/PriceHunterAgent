@@ -547,6 +547,8 @@ function StepRow({ step, index, total }) {
               {previewText || "点击查看 AI 思考过程…"}
             </div>
           )
+        ) : step.type === "tool_result" ? (
+          <ToolResultBlock message={step.message} />
         ) : (
           <div style={step.type === "answer" ? s.stepTextAnswer : s.stepText}>
             {step.type === "answer"
@@ -633,6 +635,83 @@ function ReportCard({ report, onReset, done }) {
 }
 
 // ── Markdown renderer ─────────────────────────────────────────────────────────
+// ── Tool Result Block ─────────────────────────────────────────────────────────
+function ToolResultBlock({ message }) {
+  const [expanded, setExpanded] = useState(false);
+
+  // Try to parse as JSON
+  let parsed = null;
+  try { parsed = JSON.parse(message); } catch { /* not JSON, show as text */ }
+
+  // Flatten platform map {jd:[...], taobao:[...], pdd:[...]} into one array with platform tag
+  const PLATFORM_LABEL = { jd: "京东", taobao: "淘宝", pdd: "拼多多" };
+  let products = [];
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    Object.entries(parsed).forEach(([key, val]) => {
+      if (Array.isArray(val)) val.forEach(p => products.push({ ...p, _platform: PLATFORM_LABEL[key] || key }));
+    });
+  } else if (Array.isArray(parsed)) {
+    products = parsed;
+  }
+
+  if (products.length > 0) {
+    const show = expanded ? products : products.slice(0, 6);
+    return (
+      <div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 4 }}>
+          {show.map((p, i) => (
+            <div key={i} style={s.trCard}>
+              {p._platform && (
+                <span style={{ ...s.trPlatform, color: PLATFORM_COLORS[p._platform] || "#64748b" }}>
+                  {p._platform}
+                </span>
+              )}
+              <div style={s.trName} title={p.name}>{p.name || "—"}</div>
+              <div style={s.trPrice}>{p.price || p.sold || "—"}</div>
+              {p.coupon && <div style={s.trCoupon}>🎫 {p.coupon}</div>}
+              {(p.good_rate || p.reviews_total) && (
+                <div style={s.trMeta}>
+                  {p.good_rate && <span>👍 {p.good_rate}</span>}
+                  {p.reviews_total && <span>💬 {p.reviews_total}</span>}
+                  {p.sales && <span>📦 {p.sales}</span>}
+                </div>
+              )}
+              {p.url && (
+                <a href={p.url} target="_blank" rel="noreferrer" style={s.trLink}>
+                  查看 <Icon d={icons.external} size={9} stroke="#2563eb" sw={2} />
+                </a>
+              )}
+            </div>
+          ))}
+        </div>
+        {products.length > 6 && (
+          <div style={{ marginTop: 6, fontSize: 11, color: "var(--accent)", cursor: "pointer" }}
+            onClick={() => setExpanded(v => !v)}>
+            {expanded ? "▲ 收起" : `▼ 展开全部 ${products.length} 条`}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // Non-JSON or simple string: show truncated with expand
+  const isLong = (message || "").length > 300;
+  return (
+    <div>
+      <div style={{ ...s.stepText, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+        {isLong && !expanded ? message.slice(0, 300) + "…" : message}
+      </div>
+      {isLong && (
+        <span style={{ fontSize: 11, color: "var(--accent)", cursor: "pointer", marginTop: 4, display: "inline-block" }}
+          onClick={() => setExpanded(v => !v)}>
+          {expanded ? "▲ 收起" : "▼ 展开完整内容"}
+        </span>
+      )}
+    </div>
+  );
+}
+
+// ── Markdown Block ────────────────────────────────────────────────────────────
 function MarkdownBlock({ text }) {
   const inline = (str) => {
     const parts = str.split(/(\*\*[^*]+\*\*|\[[^\]]+\]\(https?:\/\/[^\)]+\)|`[^`]+`)/g);
@@ -651,25 +730,64 @@ function MarkdownBlock({ text }) {
     });
   };
 
-  return (
-    <div>
-      {(text || "").split("\n").map((line, i) => {
-        if (line.startsWith("### ")) return <p key={i} style={s.mdH3}>{inline(line.slice(4))}</p>;
-        if (line.startsWith("## "))  return <p key={i} style={s.mdH2}>{inline(line.slice(3))}</p>;
-        if (line.startsWith("# "))   return <p key={i} style={s.mdH1}>{inline(line.slice(2))}</p>;
-        if (line.startsWith("---"))  return <hr key={i} style={s.mdHr} />;
-        if (line.match(/^\s{2,}[-*] /)) return <div key={i} style={s.mdSub}>{inline(line.replace(/^\s+[-*] /, ""))}</div>;
-        if (line.match(/^[-*] /) || line.match(/^\d+\. /)) return (
-          <div key={i} style={s.mdItem}>
-            <span style={s.mdBullet}>•</span>
-            <span>{inline(line.replace(/^[-*] /, "").replace(/^\d+\. /, ""))}</span>
-          </div>
-        );
-        if (!line.trim()) return <div key={i} style={{ height: 6 }} />;
-        return <div key={i} style={s.mdLine}>{inline(line)}</div>;
-      })}
-    </div>
-  );
+  // Group consecutive table lines and render as <table>
+  const renderTable = (rows, key) => {
+    const dataRows = rows.filter(r => !r.match(/^\|[\s|:-]+\|$/));
+    if (dataRows.length < 2) return null;
+    const headers = dataRows[0].split("|").map(c => c.trim()).filter(Boolean);
+    const body = dataRows.slice(1);
+    return (
+      <div key={key} style={{ overflowX: "auto", margin: "10px 0" }}>
+        <table style={s.mdTable}>
+          <thead>
+            <tr>{headers.map((h, j) => <th key={j} style={s.mdTh}>{inline(h)}</th>)}</tr>
+          </thead>
+          <tbody>
+            {body.map((row, ri) => {
+              const cells = row.split("|").map(c => c.trim()).filter(Boolean);
+              return (
+                <tr key={ri} style={ri % 2 === 1 ? { background: "var(--bg2)" } : {}}>
+                  {cells.map((c, ci) => <td key={ci} style={s.mdTd}>{inline(c)}</td>)}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    );
+  };
+
+  const lines = (text || "").split("\n");
+  const output = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    // Collect table block
+    if (line.trim().startsWith("|")) {
+      const tableLines = [];
+      while (i < lines.length && lines[i].trim().startsWith("|")) {
+        tableLines.push(lines[i]);
+        i++;
+      }
+      output.push(renderTable(tableLines, `tbl-${output.length}`));
+      continue;
+    }
+    if (line.startsWith("### ")) output.push(<p key={i} style={s.mdH3}>{inline(line.slice(4))}</p>);
+    else if (line.startsWith("## "))  output.push(<p key={i} style={s.mdH2}>{inline(line.slice(3))}</p>);
+    else if (line.startsWith("# "))   output.push(<p key={i} style={s.mdH1}>{inline(line.slice(2))}</p>);
+    else if (line.startsWith("---"))  output.push(<hr key={i} style={s.mdHr} />);
+    else if (line.match(/^\s{2,}[-*] /)) output.push(<div key={i} style={s.mdSub}>{inline(line.replace(/^\s+[-*] /, ""))}</div>);
+    else if (line.match(/^[-*] /) || line.match(/^\d+\. /)) output.push(
+      <div key={i} style={s.mdItem}>
+        <span style={s.mdBullet}>•</span>
+        <span>{inline(line.replace(/^[-*] /, "").replace(/^\d+\. /, ""))}</span>
+      </div>
+    );
+    else if (!line.trim()) output.push(<div key={i} style={{ height: 6 }} />);
+    else output.push(<div key={i} style={s.mdLine}>{inline(line)}</div>);
+    i++;
+  }
+  return <div>{output}</div>;
 }
 
 // ── Styles ────────────────────────────────────────────────────────────────────
@@ -820,6 +938,15 @@ const s = {
   footer: { borderTop: "1px solid var(--border)", background: "var(--surface)", padding: "16px 32px", display: "flex", alignItems: "center", justifyContent: "center", gap: 8, fontSize: 12, color: "var(--text-dim)" },
   footerDot: { color: "var(--border2)" },
 
+  // Tool result cards
+  trCard: { background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", minWidth: 160, maxWidth: 220, flex: "1 1 160px" },
+  trPlatform: { fontSize: 10, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: 4, display: "block" },
+  trName: { fontSize: 11, color: "var(--text)", lineHeight: 1.45, marginBottom: 5, overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" },
+  trPrice: { fontSize: 15, fontWeight: 700, color: "#dc2626", marginBottom: 4 },
+  trCoupon: { fontSize: 10, color: "#d97706", background: "#fffbeb", border: "1px solid #fde68a", borderRadius: 4, padding: "2px 6px", marginBottom: 4, display: "inline-block" },
+  trMeta: { display: "flex", flexWrap: "wrap", gap: 6, fontSize: 10, color: "var(--text-dim)", marginBottom: 4 },
+  trLink: { fontSize: 10, color: "var(--accent)", display: "inline-flex", alignItems: "center", gap: 2, textDecoration: "none", fontWeight: 500 },
+
   // Markdown
   mdH1: { fontSize: 16, fontWeight: 700, color: "var(--text)", margin: "16px 0 6px", letterSpacing: "-0.02em" },
   mdH2: { fontSize: 14, fontWeight: 700, color: "var(--text)", margin: "14px 0 5px", letterSpacing: "-0.01em" },
@@ -831,4 +958,7 @@ const s = {
   mdLine: { fontSize: 13, color: "var(--text-muted)", lineHeight: 1.7, marginBottom: 1 },
   mdLink: { color: "var(--accent)", fontWeight: 500, textDecoration: "underline", textDecorationColor: "#bfdbfe", display: "inline-flex", alignItems: "center", gap: 3 },
   mdCode: { background: "var(--bg2)", border: "1px solid var(--border)", borderRadius: 4, padding: "1px 5px", fontSize: "0.85em", fontFamily: "'SF Mono','Fira Code','Consolas',monospace", color: "#d97706" },
+  mdTable: { borderCollapse: "collapse", width: "100%", fontSize: 12, border: "1px solid var(--border)", borderRadius: 8 },
+  mdTh: { background: "var(--bg2)", padding: "7px 12px", textAlign: "left", fontWeight: 700, color: "var(--text)", fontSize: 12, borderBottom: "1px solid var(--border)", whiteSpace: "nowrap" },
+  mdTd: { padding: "6px 12px", color: "var(--text-muted)", borderBottom: "1px solid var(--border)", verticalAlign: "top", lineHeight: 1.5 },
 };
